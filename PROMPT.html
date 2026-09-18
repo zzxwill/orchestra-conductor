@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orchestra Conductor Simulator — Prompt</title>
+<style>
+  body { font-family: Georgia, serif; max-width: 760px; margin: 3rem auto; padding: 0 1.5rem; line-height: 1.6; color: #222; background: #faf8f4; }
+  h1 { font-family: system-ui, sans-serif; font-size: 1.6rem; }
+  h2 { font-family: system-ui, sans-serif; font-size: 1.1rem; margin-top: 2rem; }
+  blockquote { border-left: 4px solid #c9a24d; margin: 0; padding: 0.5rem 1.25rem; background: #fff; }
+  ul { padding-left: 1.25rem; }
+  li { margin: 0.3rem 0; }
+</style>
+</head>
+<body>
+
+<h1>Working demo 2: Conduct an orchestra with your hands</h1>
+
+<h2>Prompt</h2>
+<blockquote>
+<p>Create an <strong>"orchestra conductor simulator game"</strong> in HTML/JS. I'd like for it to <strong>use the webcam to detect my hand movements</strong> to understand how I'm waving a conductor wand. I'd like to conduct the orchestra through the song <em>Twinkle Twinkle Little Star</em>. <strong>As I speed up my hand movements, the orchestra should speed up and vice versa if I slow down.</strong> When I put my hands down or motion is not detected, the orchestra should stop playing.</p>
+
+<p>Keep it to a single self-contained HTML file with no external libraries: detect the motion by comparing successive webcam frames, and synthesize the instruments with the Web Audio API. Make it beautiful and stage-worthy: show a concert-hall stage where each section of the orchestra visibly lights up as it plays its notes, my mirrored webcam view with the detected motion drawn over it, a big live tempo (BPM) display, and the current lyric line.</p>
+</blockquote>
+
+<h2>Requirements checklist</h2>
+<ul>
+  <li>Single self-contained <code>.html</code> file, no external libraries</li>
+  <li>Webcam input → motion detection by comparing successive frames (frame differencing)</li>
+  <li>Motion speed drives tempo: faster waving = higher BPM, slower = lower BPM</li>
+  <li>No motion / hands down → orchestra stops playing</li>
+  <li>Instruments synthesized with the Web Audio API</li>
+  <li>Song: <em>Twinkle Twinkle Little Star</em></li>
+  <li>Visuals:
+    <ul>
+      <li>Concert-hall stage; each orchestra section lights up as it plays its notes</li>
+      <li>Mirrored webcam view with detected motion drawn over it</li>
+      <li>Big live tempo (BPM) display</li>
+      <li>Current lyric line</li>
+    </ul>
+  </li>
+</ul>
+
+</body>
+</html>
