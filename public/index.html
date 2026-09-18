@@ -134,7 +134,7 @@
     <div id="overlay">
       <div class="box">
         <h2>Take the podium</h2>
-        <p>Wave your hand like a baton in front of the webcam. Faster waving speeds the orchestra up, slower waving relaxes it, and when you put your hands down the music stops.</p>
+        <p>Sit facing the camera and hold still for a second so it can find your face — head movement is then ignored. Swing your hand like a baton beside or below your face: each change of direction is a beat, so faster swings speed the orchestra up and slower swings relax it. Put your hands down and the music stops.</p>
         <button id="startBtn">Start conducting</button>
         <div id="err"></div>
       </div>
@@ -387,21 +387,91 @@ function stopPlaying() {
 }
 
 /* ───────────────────────── Motion detection ───────────────────────── */
+// Pipeline: webcam → 160×120 → (a) skin-tone blob tracker locates the face,
+// (b) frame differencing finds motion, face region is masked out,
+// (c) the remaining motion's centroid is tracked; every direction reversal of
+//     the baton is a beat, and the beat interval gives the tempo.
 const video = document.getElementById('video');
 const camCanvas = document.getElementById('cam'), camCtx = camCanvas.getContext('2d');
 const proc = document.createElement('canvas'); proc.width = 160; proc.height = 120;
 const pctx = proc.getContext('2d', { willReadFrequently: true });
 let prevFrame = null;
 const motionImg = pctx.createImageData(proc.width, proc.height);
-const motion = { frac: 0, cx: 0.5, cy: 0.5, speed: 0, trail: [] };
-let lastCentroid = null, lastMotionTime = 0;
+const motion = { frac: 0, cx: 0.5, cy: 0.5, speed: 0, trail: [], beats: [] };
+const face = { x: 0.5, y: 0.35, r: 0, locked: false, seen: 0, misses: 0 };
+let lastCentroid = null, lastMotionTime = 0, frameNo = 0;
 const NO_MOTION_TIMEOUT = 1.5;
+
+// smoothed centroid + reversal (beat) detection
+const baton = { x: 0.5, y: 0.5, vx: 0, vy: 0, lastRevX: 0.5, lastRevY: 0.5, lastBeat: 0, intervals: [] };
+
+function isSkin(r, g, b) {
+  // YCbCr skin window, plus a red-dominance check to reject wood/beige walls
+  const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+  const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+  return cr > 135 && cr < 175 && cb > 80 && cb < 127 && r > g && r > b && r > 60;
+}
+
+// largest skin blob (4-connected) — returns {x,y,r,count} in normalised coords
+function largestSkinBlob(skin, W, H) {
+  const seen = new Uint8Array(W * H); let best = null;
+  const stack = [];
+  for (let s = 0; s < W * H; s++) {
+    if (!skin[s] || seen[s]) continue;
+    let count = 0, sx = 0, sy = 0, minx = W, maxx = 0, miny = H, maxy = 0;
+    stack.push(s); seen[s] = 1;
+    while (stack.length) {
+      const p = stack.pop(), x = p % W, y = (p / W) | 0;
+      count++; sx += x; sy += y;
+      if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y;
+      if (x > 0 && skin[p-1] && !seen[p-1]) { seen[p-1] = 1; stack.push(p-1); }
+      if (x < W-1 && skin[p+1] && !seen[p+1]) { seen[p+1] = 1; stack.push(p+1); }
+      if (y > 0 && skin[p-W] && !seen[p-W]) { seen[p-W] = 1; stack.push(p-W); }
+      if (y < H-1 && skin[p+W] && !seen[p+W]) { seen[p+W] = 1; stack.push(p+W); }
+    }
+    if (!best || count > best.count) best = { count, x: sx / count / W, y: sy / count / H, r: Math.max(maxx - minx, maxy - miny) / 2 / W };
+  }
+  return best;
+}
+
+function trackFace(data, W, H, now) {
+  const skin = new Uint8Array(W * H);
+  for (let i = 0, j = 0; i < data.length; i += 4, j++) skin[j] = isSkin(data[i], data[i+1], data[i+2]) ? 1 : 0;
+  // face candidates live in the upper 70% of the frame; hands usually swing below/beside
+  for (let y = Math.floor(H * 0.7); y < H; y++) for (let x = 0; x < W; x++) skin[y * W + x] = 0;
+  const blob = largestSkinBlob(skin, W, H);
+  if (!blob || blob.count < 40) { face.misses++; return; }
+  if (!face.locked) {
+    // lock onto the largest blob once it has been stable for ~1s
+    const near = Math.hypot(blob.x - face.x, blob.y - face.y) < 0.08;
+    if (near) face.seen++; else face.seen = 0;
+    face.x = face.x * 0.6 + blob.x * 0.4; face.y = face.y * 0.6 + blob.y * 0.4; face.r = face.r * 0.6 + blob.r * 0.4;
+    if (face.seen > 8) face.locked = true;
+  } else {
+    // only follow blobs near the current estimate, slowly — a hand crossing shouldn't drag it
+    if (Math.hypot(blob.x - face.x, blob.y - face.y) < face.r * 2.5) {
+      face.x += (blob.x - face.x) * 0.15; face.y += (blob.y - face.y) * 0.15; face.r += (Math.min(blob.r, 0.22) - face.r) * 0.1;
+      face.misses = 0;
+    } else if (++face.misses > 90) { face.locked = false; face.seen = 0; }
+  }
+}
+
+function inFaceZone(x, y) {
+  // ellipse around the face, stretched down to cover neck/shoulders
+  if (face.r <= 0) return false;
+  const rx = face.r * 1.5, ry = face.r * 2.0, cy = face.y + face.r * 0.4;
+  const dx = (x - face.x) / rx, dy = (y - cy) / ry;
+  return dx * dx + dy * dy < 1;
+}
 
 function analyseFrame(now) {
   if (video.readyState < 2) return;
   const W = proc.width, H = proc.height;
   pctx.save(); pctx.scale(-1, 1); pctx.drawImage(video, -W, 0, W, H); pctx.restore();
   const data = pctx.getImageData(0, 0, W, H).data;
+  frameNo++;
+  if (frameNo % 3 === 0) trackFace(data, W, H, now);
+
   const cur = new Uint8ClampedArray(W * H);
   for (let i = 0, j = 0; i < data.length; i += 4, j++) cur[j] = (data[i] * 3 + data[i+1] * 6 + data[i+2]) / 10;
 
@@ -413,7 +483,9 @@ function analyseFrame(now) {
       const diff = Math.abs(cur[j] - prevFrame[j]);
       const k = j * 4;
       if (diff > thresh) {
-        count++; sx += j % W; sy += (j / W) | 0;
+        const x = j % W, y = (j / W) | 0;
+        if (inFaceZone(x / W, y / H)) { md[k] = 120; md[k+1] = 120; md[k+2] = 140; md[k+3] = 70; continue; } // ignored
+        count++; sx += x; sy += y;
         md[k] = 255; md[k+1] = 205 + Math.min(50, diff); md[k+2] = 60; md[k+3] = Math.min(255, 90 + diff * 2);
       } else md[k+3] = 0;
     }
@@ -423,29 +495,53 @@ function analyseFrame(now) {
   const frac = count / (W * H);
   const sens = parseFloat(sensEl.value);
   motion.frac = frac;
+  const tSec = now / 1000;
+
   if (count > 12) {
     const cx = sx / count / W, cy = sy / count / H;
     if (lastCentroid) {
       const dt = Math.max(0.008, (now - lastCentroid.t) / 1000);
-      const v = Math.hypot(cx - lastCentroid.x, cy - lastCentroid.y) / dt; // frame widths / s
+      const v = Math.hypot(cx - lastCentroid.x, cy - lastCentroid.y) / dt;
       motion.speed = motion.speed * 0.7 + v * 0.3;
+      // smoothed baton position + velocity
+      const nx = baton.x * 0.5 + cx * 0.5, ny = baton.y * 0.5 + cy * 0.5;
+      const vx = (nx - baton.x) / dt, vy = (ny - baton.y) / dt;
+      // a reversal = sign flip with real velocity, after enough travel since the last one
+      const revX = Math.sign(vx) !== Math.sign(baton.vx) && Math.abs(baton.vx) > 0.25 && Math.abs(nx - baton.lastRevX) > 0.05;
+      const revY = Math.sign(vy) !== Math.sign(baton.vy) && Math.abs(baton.vy) > 0.25 && Math.abs(ny - baton.lastRevY) > 0.05;
+      if ((revX || revY) && tSec - baton.lastBeat > 0.22) {
+        const interval = tSec - baton.lastBeat;
+        if (interval < 1.4) { baton.intervals.push(interval); if (baton.intervals.length > 4) baton.intervals.shift(); }
+        baton.lastBeat = tSec;
+        if (revX) baton.lastRevX = nx; if (revY) baton.lastRevY = ny;
+        motion.beats.push({ x: nx, y: ny, t: now });
+        if (motion.beats.length > 6) motion.beats.shift();
+      }
+      baton.vx = baton.vx * 0.4 + vx * 0.6; baton.vy = baton.vy * 0.4 + vy * 0.6;
+      baton.x = nx; baton.y = ny;
     }
     lastCentroid = { x: cx, y: cy, t: now };
     motion.cx = cx; motion.cy = cy;
     motion.trail.push({ x: cx, y: cy, t: now }); if (motion.trail.length > 24) motion.trail.shift();
   } else { motion.speed *= 0.85; }
 
-  // energy: pixel fraction changed (scaled); speed: centroid velocity
   const energy = Math.min(1, frac * sens / 0.06);
   const spd = Math.min(1, motion.speed * sens / 2.2);
   const raw = Math.min(1, energy * 0.65 + spd * 0.35);
   state.level = state.level * 0.8 + raw * 0.2;
 
   const active = state.level > 0.06;
-  if (active) lastMotionTime = now / 1000;
+  if (active) lastMotionTime = tSec;
 
-  if (!manualEl.checked) {
-    if (active) {
+  if (!manualEl.checked && active) {
+    const recentBeat = tSec - baton.lastBeat < 2 && baton.intervals.length >= 2;
+    if (recentBeat) {
+      // tempo from the baton's swing rate: median interval between reversals
+      const sorted = [...baton.intervals].sort((a, b) => a - b);
+      const med = sorted[Math.floor(sorted.length / 2)];
+      state.targetBpm = Math.max(60, Math.min(160, 60 / med));
+    } else {
+      // fallback while beats are still being established: motion energy
       state.targetBpm = 60 + Math.pow(Math.min(1, (state.level - 0.06) / 0.7), 0.85) * 100;
     }
   }
@@ -462,6 +558,17 @@ function drawCam() {
   camCtx.globalCompositeOperation = 'lighter';
   camCtx.drawImage(tmp, 0, 0, W, H);
   camCtx.globalCompositeOperation = 'source-over';
+  // face zone (ignored)
+  if (face.r > 0) {
+    const rx = face.r * 1.5 * W, ry = face.r * 2.0 * H, cy = (face.y + face.r * 0.4) * H;
+    camCtx.setLineDash([4, 4]); camCtx.lineWidth = 1.5;
+    camCtx.strokeStyle = face.locked ? 'rgba(180,180,220,.8)' : 'rgba(180,180,220,.35)';
+    camCtx.beginPath(); camCtx.ellipse(face.x * W, cy, rx, ry, 0, 0, Math.PI * 2); camCtx.stroke();
+    camCtx.setLineDash([]);
+    camCtx.font = '11px system-ui, sans-serif'; camCtx.textAlign = 'center';
+    camCtx.fillStyle = 'rgba(200,200,230,.85)';
+    camCtx.fillText(face.locked ? 'face ignored' : 'finding face… hold still', face.x * W, cy - ry - 5);
+  }
   // baton trail
   if (motion.trail.length > 1 && state.level > 0.04) {
     camCtx.lineCap = 'round'; camCtx.lineJoin = 'round';
@@ -475,6 +582,13 @@ function drawCam() {
     g.addColorStop(0, 'rgba(255,240,180,.95)'); g.addColorStop(1, 'rgba(255,200,80,0)');
     camCtx.fillStyle = g; camCtx.beginPath(); camCtx.arc(motion.cx * W, motion.cy * H, r, 0, Math.PI * 2); camCtx.fill();
   }
+  // beat markers where the baton reversed
+  const now = performance.now();
+  motion.beats.forEach(b => {
+    const age = (now - b.t) / 600; if (age > 1) return;
+    camCtx.strokeStyle = `rgba(255,255,255,${1 - age})`; camCtx.lineWidth = 2;
+    camCtx.beginPath(); camCtx.arc(b.x * W, b.y * H, 6 + age * 22, 0, Math.PI * 2); camCtx.stroke();
+  });
   // vignette frame
   camCtx.strokeStyle = 'rgba(230,195,106,.35)'; camCtx.lineWidth = 2; camCtx.strokeRect(1, 1, W - 2, H - 2);
 }
@@ -647,7 +761,7 @@ let lastAnalyse = 0;
 function loop(now) {
   requestAnimationFrame(loop);
   if (state.running) {
-    if (video.srcObject && now - lastAnalyse > 33) { lastAnalyse = now; analyseFrame(now); drawCam(); }
+    if (video.srcObject && now - lastAnalyse > 33) { lastAnalyse = now; analyseFrame(now); drawCam(); if (face.locked && statusText.textContent.startsWith('Hold still')) setStatus('paused', 'Raise your baton'); }
 
     const t = ctx.currentTime;
     // manual override
@@ -689,7 +803,7 @@ document.getElementById('startBtn').addEventListener('click', async () => {
     video.srcObject = stream; await video.play();
     camCanvas.width = 320; camCanvas.height = 240;
     document.getElementById('camHint').remove();
-    setStatus('paused', 'Raise your baton');
+    setStatus('paused', 'Hold still — finding your face');
   } catch (e) {
     err.textContent = 'Camera unavailable (' + e.message + ') — switching to manual tempo.';
     manualEl.checked = true;
