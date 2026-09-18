@@ -77,7 +77,8 @@
     color: var(--gold-dim); font-weight: 600;
   }
   #camWrap { position: relative; aspect-ratio: 4/3; background: #000; border-radius: 6px; overflow: hidden; }
-  #cam { width: 100%; height: 100%; display: block; }
+  #cam { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+  #cam.dragging { cursor: grabbing; }
   #camHint { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; text-align: center; padding: 12px; }
   #meter { height: 6px; background: #241b2e; border-radius: 3px; margin-top: 8px; overflow: hidden; }
   #meterFill { height: 100%; width: 0%; background: linear-gradient(90deg, #5ee08a, var(--gold), #ff6b4a); transition: width .08s; }
@@ -167,6 +168,7 @@
       <div class="ctl"><span>Sensitivity</span><input id="sens" type="range" min="0.3" max="3" step="0.1" value="1"><output id="sensOut">1.0</output></div>
       <div class="ctl"><span>Volume</span><input id="vol" type="range" min="0" max="1" step="0.01" value="0.8"><output id="volOut">80</output></div>
       <label class="chk"><input id="manual" type="checkbox"> Manual tempo (ignore camera)</label>
+      <label class="chk"><input id="pinFace" type="checkbox"> Pin face zone (drag it on the cam, scroll to resize)</label>
       <div class="ctl"><span>Tempo</span><input id="manualBpm" type="range" min="50" max="180" step="1" value="100"><output id="manualOut">100</output></div>
     </div>
   </aside>
@@ -398,7 +400,7 @@ const pctx = proc.getContext('2d', { willReadFrequently: true });
 let prevFrame = null;
 const motionImg = pctx.createImageData(proc.width, proc.height);
 const motion = { frac: 0, cx: 0.5, cy: 0.5, speed: 0, trail: [], beats: [] };
-const face = { x: 0.5, y: 0.35, r: 0, locked: false, seen: 0, misses: 0 };
+const face = { x: 0.5, y: 0.35, r: 0, locked: false, seen: 0, misses: 0, pinned: false };
 let lastCentroid = null, lastMotionTime = 0, frameNo = 0;
 const NO_MOTION_TIMEOUT = 1.5;
 
@@ -435,6 +437,7 @@ function largestSkinBlob(skin, W, H) {
 }
 
 function trackFace(data, W, H, now) {
+  if (face.pinned) return;
   const skin = new Uint8Array(W * H);
   for (let i = 0, j = 0; i < data.length; i += 4, j++) skin[j] = isSkin(data[i], data[i+1], data[i+2]) ? 1 : 0;
   // face candidates live in the upper 70% of the frame; hands usually swing below/beside
@@ -562,12 +565,12 @@ function drawCam() {
   if (face.r > 0) {
     const rx = face.r * 1.5 * W, ry = face.r * 2.0 * H, cy = (face.y + face.r * 0.4) * H;
     camCtx.setLineDash([4, 4]); camCtx.lineWidth = 1.5;
-    camCtx.strokeStyle = face.locked ? 'rgba(180,180,220,.8)' : 'rgba(180,180,220,.35)';
+    camCtx.strokeStyle = face.pinned ? 'rgba(230,195,106,.9)' : face.locked ? 'rgba(180,180,220,.8)' : 'rgba(180,180,220,.35)';
     camCtx.beginPath(); camCtx.ellipse(face.x * W, cy, rx, ry, 0, 0, Math.PI * 2); camCtx.stroke();
     camCtx.setLineDash([]);
     camCtx.font = '11px system-ui, sans-serif'; camCtx.textAlign = 'center';
     camCtx.fillStyle = 'rgba(200,200,230,.85)';
-    camCtx.fillText(face.locked ? 'face ignored' : 'finding face… hold still', face.x * W, cy - ry - 5);
+    camCtx.fillText(face.pinned ? 'face zone pinned' : face.locked ? 'face ignored' : 'finding face… hold still', face.x * W, cy - ry - 5);
   }
   // baton trail
   if (motion.trail.length > 1 && state.level > 0.04) {
@@ -591,6 +594,31 @@ function drawCam() {
   });
   // vignette frame
   camCtx.strokeStyle = 'rgba(230,195,106,.35)'; camCtx.lineWidth = 2; camCtx.strokeRect(1, 1, W - 2, H - 2);
+}
+
+// Manual face zone: drag the ellipse on the cam view, scroll to resize. Pins it so the tracker stops moving it.
+const pinFaceEl = document.getElementById('pinFace');
+pinFaceEl.onchange = () => { face.pinned = pinFaceEl.checked; if (face.pinned && face.r <= 0) face.r = 0.12; if (face.pinned) face.locked = true; };
+function pinFace() { if (!face.pinned) { face.pinned = true; pinFaceEl.checked = true; face.locked = true; } }
+{
+  let drag = null;
+  const norm = e => { const r = camCanvas.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }; };
+  camCanvas.addEventListener('pointerdown', e => {
+    if (!state.running) return;
+    const p = norm(e); pinFace();
+    if (face.r <= 0) face.r = 0.12;
+    drag = { dx: face.x - p.x, dy: face.y - p.y }; camCanvas.setPointerCapture(e.pointerId); camCanvas.classList.add('dragging');
+  });
+  camCanvas.addEventListener('pointermove', e => {
+    if (!drag) return; const p = norm(e);
+    face.x = Math.min(1, Math.max(0, p.x + drag.dx)); face.y = Math.min(1, Math.max(0, p.y + drag.dy));
+  });
+  const end = () => { drag = null; camCanvas.classList.remove('dragging'); };
+  camCanvas.addEventListener('pointerup', end); camCanvas.addEventListener('pointercancel', end);
+  camCanvas.addEventListener('wheel', e => {
+    if (!state.running) return; e.preventDefault(); pinFace();
+    face.r = Math.min(0.35, Math.max(0.04, (face.r || 0.12) * (e.deltaY < 0 ? 1.06 : 0.94)));
+  }, { passive: false });
 }
 
 /* ───────────────────────── Stage rendering ───────────────────────── */
