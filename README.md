@@ -17,4 +17,8 @@ Open `index.html` in Chrome, or serve the folder:
 python3 -m http.server 8000
 ```
 
+Live: https://orchestra-conductor.zzxwill.workers.dev
+
+Deploy with `npx wrangler deploy` (static assets from `public/`).
+
 `PROMPT.html` is the original brief the app was built from.
